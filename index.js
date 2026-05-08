@@ -1,6 +1,7 @@
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const { createCanvas, loadImage } = require('canvas');
+const http = require('http');
 require('dotenv').config();
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -360,3 +361,11 @@ bot.launch();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Alien Bot is running!\n');
+});
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+});
