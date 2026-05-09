@@ -6,18 +6,13 @@ require('dotenv').config();
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-const callsDB = [];
-const leaderboardDB = {};
+const groupCalls = {};
+const groupLeaderboard = {};
 
 const evmRegex = /0x[a-fA-F0-9]{40}/i;
 const solRegex = /[1-9A-HJ-NP-Za-km-z]{32,44}/;
 const tonRegex = /EQ[a-zA-Z0-9_-]{46}/i;
-
-const deleteMarkup = {
-  reply_markup: {
-    inline_keyboard: [[{ text: '🗑️', callback_data: 'delete_msg' }]]
-  }
-};
+const cashtagRegex = /(?:^|\s)\$([a-zA-Z0-9]{2,10})(?=\s|$)/;
 
 const formatNumber = (num) => {
   if (!num) return '0';
@@ -52,20 +47,151 @@ const escapeHTML = (str) => {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 };
 
+async function getTokenMessage(address, callerInfo, chatId) {
+  try {
+    const dexResponse = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
+    const pairs = dexResponse.data.pairs;
+    
+    if (!pairs || pairs.length === 0) return null;
+
+    const pair = pairs[0];
+    const chainId = pair.chainId;
+    const symbol = escapeHTML(pair.baseToken.symbol);
+    const name = escapeHTML(pair.baseToken.name);
+    const priceUsd = pair.priceUsd;
+    const mc = formatNumber(pair.fdv);
+    const vol = formatNumber(pair.volume.h24);
+    const lp = formatNumber(pair.liquidity.usd);
+    
+    const priceChange24h = pair.priceChange?.h24 || 0;
+    const sign24h = priceChange24h >= 0 ? '+' : '';
+    const priceChange1h = pair.priceChange?.h1 || 0;
+    const sign1h = priceChange1h >= 0 ? '+' : '';
+    
+    const buys1h = pair.txns?.h1?.buys || 0;
+    const sells1h = pair.txns?.h1?.sells || 0;
+    const icon = getChainIcon(chainId, pair.url, pair.labels);
+
+    let xLink = '';
+    let webLink = '';
+    if (pair.info && pair.info.socials) {
+        const xSocial = pair.info.socials.find(s => s.type === 'twitter');
+        if (xSocial) xLink = `<a href="${xSocial.url}">X [@]</a> • `;
+    }
+    if (pair.info && pair.info.websites && pair.info.websites.length > 0) {
+        webLink = `<a href="${pair.info.websites[0].url}">Web</a>`;
+    }
+
+    let taxBuy = 'N/A';
+    let taxSell = 'N/A';
+    let lpLocked = 'Unknown';
+
+    if (chainId === 'ethereum' || chainId === 'base') {
+      try {
+        const goPlusId = chainId === 'ethereum' ? '1' : '8453';
+        const secRes = await axios.get(`https://api.gopluslabs.io/api/v1/token_security/${goPlusId}?contract_addresses=${address}`);
+        const data = secRes.data.result[address.toLowerCase()];
+        if (data) {
+          taxBuy = data.buy_tax === "" ? "0%" : `${(Number(data.buy_tax) * 100).toFixed(1)}%`;
+          taxSell = data.sell_tax === "" ? "0%" : `${(Number(data.sell_tax) * 100).toFixed(1)}%`;
+          lpLocked = data.lp_holders && data.lp_holders.some(h => h.is_locked === 1) ? "Yes" : "No";
+        }
+      } catch (e) {}
+    }
+
+    if (!groupCalls[chatId]) groupCalls[chatId] = [];
+    let call = groupCalls[chatId].find(c => c.address.toLowerCase() === address.toLowerCase());
+    
+    if (!call && callerInfo) {
+      call = { 
+        address, 
+        caller: callerInfo, 
+        time: Date.now(), 
+        mcapFormatted: mc, 
+        priceRaw: Number(priceUsd), 
+        symbol, 
+        icon, 
+        athPrice: Number(priceUsd) 
+      };
+      groupCalls[chatId].unshift(call);
+      if (groupCalls[chatId].length > 15) groupCalls[chatId].pop();
+      
+      if (!groupLeaderboard[chatId]) groupLeaderboard[chatId] = {};
+      groupLeaderboard[chatId][callerInfo] = (groupLeaderboard[chatId][callerInfo] || 0) + 1;
+    }
+
+    const age = call ? getTimeElapsed(call.time) : '0m';
+    const firstCaller = call ? call.caller : (callerInfo || 'Unknown');
+    const firstMcap = call ? call.mcapFormatted : mc;
+
+    let text = `${icon} ${name} ($${symbol})
+├ <code>${address}</code>
+└ #${chainId.toUpperCase()} | ${age} | 👀 41
+
+📊 <b>Stats</b>
+├ <b>USD</b>  <b>$${priceUsd}</b> (${sign24h}${priceChange24h}%)
+├ <b>MC</b>   <b>$${mc}</b>
+├ <b>Vol</b>  <b>$${vol}</b>
+├ <b>LP</b>   <b>$${lp}</b>
+├ <b>1H</b>   <b>${sign1h}${priceChange1h}%</b> 🟢 <b>${buys1h}</b> 🔴 <b>${sells1h}</b>
+└ <b>ATH</b>  <b>N/A</b>
+
+🔗 <b>Socials</b>
+└ ${xLink}${webLink}`;
+
+    if (chainId === 'ethereum' || chainId === 'base') {
+      text += `\n\n🔒 <b>Security</b>
+├ <b>Tax</b>     <b>Buy: ${taxBuy} | Sell: ${taxSell}</b>
+└ <b>LP Lock</b> <b>${lpLocked}</b>`;
+    }
+
+    text += `\n\n<a href="${pair.url}">DS</a> • <a href="https://gmgn.ai/${chainId}/token/${address}">GMGN</a>\n\n😈 @${firstCaller} @ $${firstMcap}`;
+
+    return { text, banner: pair.info?.header || pair.info?.imageUrl };
+  } catch (e) {
+    return null;
+  }
+}
+
 bot.action('delete_msg', async (ctx) => {
   try {
     await ctx.deleteMessage();
-  } catch (error) {
+  } catch (error) {}
+});
+
+bot.action(/refresh:(.+)/, async (ctx) => {
+  const address = ctx.match[1];
+  const data = await getTokenMessage(address, null, ctx.chat.id);
+  
+  if (data) {
+    const markup = { 
+      inline_keyboard: [
+        [{ text: '🔄 Refresh', callback_data: `refresh:${address}` }, { text: '🗑️', callback_data: 'delete_msg' }]
+      ] 
+    };
+    try {
+      if (ctx.callbackQuery.message.photo) {
+        await ctx.editMessageCaption(data.text, { parse_mode: 'HTML', reply_markup: markup });
+      } else {
+        await ctx.editMessageText(data.text, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup });
+      }
+    } catch (e) {}
   }
+  await ctx.answerCbQuery('Stats Refreshed!');
 });
 
 bot.command('calls', async (ctx) => {
-  if (callsDB.length === 0) return ctx.reply('No recent calls.', deleteMarkup);
+  const chatId = ctx.chat.id;
+  const calls = groupCalls[chatId] || [];
+  
+  const markup = { inline_keyboard: [[{ text: '🗑️', callback_data: 'delete_msg' }]] };
+
+  if (calls.length === 0) return ctx.reply('No recent calls in this group.', markup);
 
   let text = `📞 <b>Last 15 Calls</b>\n\n`;
   let callsLines = [];
 
-  for (const call of callsDB) {
+  for (const call of calls) {
     try {
       const dexResponse = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${call.address}`);
       const pair = dexResponse.data.pairs ? dexResponse.data.pairs[0] : null;
@@ -93,24 +219,29 @@ bot.command('calls', async (ctx) => {
   }
 
   text += callsLines.join('\n\n');
-  ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...deleteMarkup });
+  ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...markup });
 });
 
 bot.command('lb', async (ctx) => {
-  const sorted = Object.entries(leaderboardDB).sort((a, b) => b[1].points - a[1].points);
+  const chatId = ctx.chat.id;
+  const lbData = groupLeaderboard[chatId] || {};
+  const calls = groupCalls[chatId] || [];
+  const markup = { inline_keyboard: [[{ text: '🗑️', callback_data: 'delete_msg' }]] };
+
+  const sorted = Object.entries(lbData).sort((a, b) => b[1] - a[1]);
   
   let text = `🏆 <b>Leaderboard</b>\n\n👑 <b>Top Callers</b>\n`;
   if (sorted.length > 0) {
-    text += `└ 🥇 ${escapeHTML(sorted[0][0])} [${sorted[0][1].points.toFixed(1)} pts]\n`;
+    text += `└ 🥇 ${escapeHTML(sorted[0][0])} [${sorted[0][1].toFixed(1)} pts]\n`;
   } else {
     text += `└ No callers yet.\n`;
   }
 
-  text += `\n📊 <b>Group Stats</b>\n├ Period 1d\n├ Calls ${callsDB.length}\n├ Hit Rate 0%\n├ Median 0%\n└ Return 1.0x (Avg: 1.0x)\n\n`;
+  text += `\n📊 <b>Group Stats</b>\n├ Period 1d\n├ Calls ${calls.length}\n├ Hit Rate 0%\n├ Median 0%\n└ Return 1.0x (Avg: 1.0x)\n\n`;
 
   let listLines = [];
-  for (let i = 0; i < Math.min(callsDB.length, 6); i++) {
-    const call = callsDB[i];
+  for (let i = 0; i < Math.min(calls.length, 6); i++) {
+    const call = calls[i];
     let multiplier = "1.0x";
     let perfEmoji = "😎";
     
@@ -130,10 +261,11 @@ bot.command('lb', async (ctx) => {
   }
 
   text += listLines.join('\n\n');
-  ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...deleteMarkup });
+  ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...markup });
 });
 
 bot.command('p', async (ctx) => {
+  const markup = { inline_keyboard: [[{ text: '🗑️', callback_data: 'delete_msg' }]] };
   const parts = ctx.message.text.split(' ');
   if (parts.length < 2) return;
   const query = parts[1].toLowerCase();
@@ -141,7 +273,7 @@ bot.command('p', async (ctx) => {
   try {
     const dexResponse = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${query}`);
     if (!dexResponse.data.pairs || dexResponse.data.pairs.length === 0) {
-      return ctx.reply('Token not found.', deleteMarkup);
+      return ctx.reply('Token not found.', markup);
     }
 
     const pair = dexResponse.data.pairs[0];
@@ -153,30 +285,36 @@ bot.command('p', async (ctx) => {
     const priceChange = pair.priceChange?.h24 || 0;
     const sign = priceChange >= 0 ? '+' : '';
 
-    const text = `<a href="${pair.url}">${name}</a> ($${symbol})\n\nPrice: <b>$${priceUsd}</b> (${sign}${priceChange}%)\nLow: N/A\nHigh: N/A\nMC/FDV: <b>$${mc} / $${mc}</b>\nRank: N/A\nATH: N/A\n\nVolume: $${vol24}`;
+    const text = `<a href="${pair.url}">${name}</a> ($${symbol})\n\nPrice: <b>$${priceUsd}</b> (${sign}${priceChange}%)\nLow: N/A\nHigh: N/A\nMC/FDV: <b>$${mc} / $${mc}</b>\nRank: N/A\nATH: N/A\n\nVolume: <b>$${vol24}</b>`;
 
-    ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...deleteMarkup });
-  } catch (error) {
-  }
+    ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...markup });
+  } catch (error) {}
 });
 
 bot.command('fc', (ctx) => {
+  const markup = { inline_keyboard: [[{ text: '🗑️', callback_data: 'delete_msg' }]] };
   const parts = ctx.message.text.split(' ');
   if (parts.length < 2) return;
   const address = parts[1];
-  const call = callsDB.find(c => c.address === address);
+  const calls = groupCalls[ctx.chat.id] || [];
+  const call = calls.find(c => c.address.toLowerCase() === address.toLowerCase());
+  
   if (call) {
-    ctx.reply(`First caller for ${address} is @${call.caller} at ${call.mcapFormatted}`, deleteMarkup);
+    ctx.reply(`First caller for ${address} is @${call.caller} at ${call.mcapFormatted}`, markup);
+  } else {
+    ctx.reply('Token not found in group history.', markup);
   }
 });
 
 bot.command('c', (ctx) => {
+  const markup = { inline_keyboard: [[{ text: '🗑️', callback_data: 'delete_msg' }]] };
   const parts = ctx.message.text.split(' ');
   if (parts.length < 2) return;
-  ctx.reply(`Chart link: https://dexscreener.com/search?q=${parts[1]}`, deleteMarkup);
+  ctx.reply(`Chart link: https://dexscreener.com/search?q=${parts[1]}`, markup);
 });
 
 bot.command('pnl', async (ctx) => {
+  const markup = { inline_keyboard: [[{ text: '🗑️', callback_data: 'delete_msg' }]] };
   const parts = ctx.message.text.split(' ');
   if (parts.length < 3) return;
 
@@ -226,9 +364,8 @@ bot.command('pnl', async (ctx) => {
     c.fillText(`${isProfit ? '+' : ''}${percent}%`, 160, 220);
 
     const buffer = canvas.toBuffer('image/png');
-    await ctx.replyWithPhoto({ source: buffer }, { ...deleteMarkup });
-  } catch (error) {
-  }
+    await ctx.replyWithPhoto({ source: buffer }, { ...markup });
+  } catch (error) {}
 });
 
 bot.on('text', async (ctx) => {
@@ -236,123 +373,35 @@ bot.on('text', async (ctx) => {
   if (text.startsWith('/')) return;
 
   const msgMatch = text.match(evmRegex) || text.match(solRegex) || text.match(tonRegex);
+  const tickerMatch = text.match(cashtagRegex);
 
-  if (msgMatch) {
-    const address = msgMatch[0];
-    const caller = ctx.from.username || ctx.from.first_name;
+  let address = msgMatch ? msgMatch[0] : null;
 
+  if (!address && tickerMatch) {
     try {
-      const dexResponse = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
-      const pairs = dexResponse.data.pairs;
-
-      if (!pairs || pairs.length === 0) return;
-
-      const pair = pairs[0];
-      const chainId = pair.chainId;
-      const symbol = escapeHTML(pair.baseToken.symbol);
-      const name = escapeHTML(pair.baseToken.name);
-      const priceUsd = Number(pair.priceUsd);
-      const mcRaw = pair.fdv || 0;
-      const mc = formatNumber(mcRaw);
-      const vol = formatNumber(pair.volume.h24);
-      const lp = formatNumber(pair.liquidity.usd);
-      const dsUrl = pair.url;
-      const gmgnUrl = `https://gmgn.ai/${chainId}/token/${address}`;
-      const bannerUrl = pair.info?.header || pair.info?.imageUrl;
-      
-      const priceChange24h = pair.priceChange?.h24 || 0;
-      const sign24h = priceChange24h >= 0 ? '+' : '';
-      const priceChange1h = pair.priceChange?.h1 || 0;
-      const sign1h = priceChange1h >= 0 ? '+' : '';
-      
-      const buys1h = pair.txns?.h1?.buys || 0;
-      const sells1h = pair.txns?.h1?.sells || 0;
-
-      const icon = getChainIcon(chainId, dsUrl, pair.labels);
-      
-      let xLink = '';
-      let webLink = '';
-      if (pair.info && pair.info.socials) {
-          const xSocial = pair.info.socials.find(s => s.type === 'twitter');
-          if (xSocial) xLink = `<a href="${xSocial.url}">X [@]</a> • `;
+      const search = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${tickerMatch[1]}`);
+      if (search.data.pairs && search.data.pairs.length > 0) {
+        address = search.data.pairs[0].baseToken.address;
       }
-      if (pair.info && pair.info.websites && pair.info.websites.length > 0) {
-          webLink = `<a href="${pair.info.websites[0].url}">Web</a>`;
-      }
+    } catch (e) {}
+  }
 
-      let taxBuy = 'N/A';
-      let taxSell = 'N/A';
-      let lpLocked = 'Unknown';
+  if (address) {
+    const caller = ctx.from.username || ctx.from.first_name;
+    const data = await getTokenMessage(address, caller, ctx.chat.id);
 
-      if (chainId === 'ethereum') {
-        try {
-          const goPlusResponse = await axios.get(`https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses=${address}`);
-          const securityData = goPlusResponse.data.result[address.toLowerCase()];
+    if (data) {
+      const markup = { 
+        inline_keyboard: [
+          [{ text: '🔄 Refresh', callback_data: `refresh:${address}` }, { text: '🗑️', callback_data: 'delete_msg' }]
+        ] 
+      };
 
-          if (securityData) {
-            taxBuy = securityData.buy_tax === "" ? "0%" : `${(Number(securityData.buy_tax) * 100).toFixed(1)}%`;
-            taxSell = securityData.sell_tax === "" ? "0%" : `${(Number(securityData.sell_tax) * 100).toFixed(1)}%`;
-            lpLocked = securityData.is_in_dex === "1" ? "Check LP" : "Unknown";
-          }
-        } catch (error) {
-        }
-      }
-
-      const isFirstCall = !callsDB.find(c => c.address === address);
-
-      if (isFirstCall) {
-        callsDB.unshift({ 
-          address, 
-          caller, 
-          time: Date.now(), 
-          mcapFormatted: mc, 
-          priceRaw: priceUsd,
-          athPrice: priceUsd,
-          symbol,
-          name,
-          icon
-        });
-        if (callsDB.length > 15) callsDB.pop();
-
-        if (!leaderboardDB[caller]) leaderboardDB[caller] = { points: 0, hits: 0 };
-        leaderboardDB[caller].points += 1;
-      }
-
-      const originalCall = callsDB.find(c => c.address === address);
-      const callerName = originalCall ? originalCall.caller : caller;
-      const calledMcap = originalCall ? originalCall.mcapFormatted : mc;
-      const ageStr = originalCall ? getTimeElapsed(originalCall.time) : '0m';
-
-      let responseText = `${icon} ${name} ($${symbol})
-├ <code>${address}</code>
-└ #${chainId.toUpperCase()} | ${ageStr} | 👀 41
-
-📊 Stats
-├ USD  <b>$${priceUsd}</b> (${sign24h}${priceChange24h}%)
-├ MC   <b>$${mc}</b>
-├ Vol  $${vol}
-├ LP   $${lp}
-├ 1H   ${sign1h}${priceChange1h}% 🟢 ${buys1h} 🔴 ${sells1h}
-└ ATH  N/A
-
-🔗 Socials
-└ ${xLink}${webLink}`;
-
-      if (chainId === 'ethereum' || chainId === 'base') {
-          responseText += `\n\n🔒 Security
-├ Tax     Buy: ${taxBuy} | Sell: ${taxSell}
-└ LP Lock ${lpLocked}`;
-      }
-
-      responseText += `\n\n<a href="${dsUrl}">DS</a> • <a href="${gmgnUrl}">GMGN</a>\n\n😈 @${callerName} @ $${calledMcap}`;
-
-      if (bannerUrl) {
-        await ctx.replyWithPhoto({ url: bannerUrl }, { caption: responseText, parse_mode: 'HTML', ...deleteMarkup });
+      if (data.banner) {
+        await ctx.replyWithPhoto({ url: data.banner }, { caption: data.text, parse_mode: 'HTML', reply_markup: markup });
       } else {
-        await ctx.reply(responseText, { parse_mode: 'HTML', disable_web_page_preview: true, ...deleteMarkup });
+        await ctx.reply(data.text, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup });
       }
-
-    } catch (error) {
     }
   }
 });
@@ -367,5 +416,4 @@ const server = http.createServer((req, res) => {
   res.end('Alien Bot is running!\n');
 });
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-});
+server.listen(PORT, () => {});
